@@ -316,7 +316,7 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
                             (value_information_block.value_information.data & 0b111) as isize - 9;
                     }
                     0x50..=0x57 => {
-                        units.push(unit!(Kilogram ^ 3));
+                        units.push(unit!(Kilogram));
                         units.push(unit!(Hour ^ -1));
                         labels.push(ValueLabel::MassFlow);
                         decimal_scale_exponent +=
@@ -375,6 +375,7 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
                     &mut units,
                     &mut decimal_scale_exponent,
                     &mut decimal_offset_exponent,
+                    false,
                 );
             }
             ValueInformationCoding::MainVIFExtension => {
@@ -479,6 +480,7 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
                         units.push(unit!(Day));
                         labels.push(ValueLabel::PeriodOfNormalDataTransmission);
                     }
+                    0x3A => labels.push(ValueLabel::Dimensionless),
                     0x40..=0x4F => {
                         units.push(unit!(Volt));
                         labels.push(ValueLabel::Voltage);
@@ -556,6 +558,14 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
                     },
                     _ => labels.push(ValueLabel::Reserved),
                 }
+                consume_orthhogonal_vife(
+                    value_information_block,
+                    &mut labels,
+                    &mut units,
+                    &mut decimal_scale_exponent,
+                    &mut decimal_offset_exponent,
+                    true,
+                );
             }
             ValueInformationCoding::AlternateVIFExtension => {
                 use UnitName::*;
@@ -613,6 +623,7 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
                     0b001_1000 => populate!(Tonne, 1, dec: 2),
                     0b001_1001 => populate!(Tonne, 1, dec: 3),
                     0b001_1010 => populate!(Percent, 1, dec: -1, RelativeHumidity),
+                    0b001_1011 => populate!(Percent, 1, dec: 0, RelativeHumidity),
                     0b010_0001 => populate!(Feet, 3, dec: -1),
                     0b010_0010 => populate!(AmericanGallon, 1, dec: -1),
                     0b010_0011 => populate!(AmericanGallon, 1, dec: 0),
@@ -677,10 +688,28 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
 
                     _ => labels.push(ValueLabel::Reserved),
                 };
+                consume_orthhogonal_vife(
+                    value_information_block,
+                    &mut labels,
+                    &mut units,
+                    &mut decimal_scale_exponent,
+                    &mut decimal_offset_exponent,
+                    true,
+                );
             }
             // we need to check if the next byte is equivalent to the length of the rest of the
             // the data. In this case it is very likely that, this is how the payload is built up.
-            ValueInformationCoding::PlainText => labels.push(ValueLabel::PlainText),
+            ValueInformationCoding::PlainText => {
+                labels.push(ValueLabel::PlainText);
+                consume_orthhogonal_vife(
+                    value_information_block,
+                    &mut labels,
+                    &mut units,
+                    &mut decimal_scale_exponent,
+                    &mut decimal_offset_exponent,
+                    false,
+                );
+            }
             ValueInformationCoding::ManufacturerSpecific => {
                 labels.push(ValueLabel::ManufacturerSpecific)
             }
@@ -695,16 +724,20 @@ impl TryFrom<&ValueInformationBlock> for ValueInformation {
     }
 }
 
+/// When `skip_extension_vife` is true, the first VIFE is skipped because it is
+/// the 0xFD/0xFB extension code already consumed by the main VIF match.
 fn consume_orthhogonal_vife(
     value_information_block: &ValueInformationBlock,
     labels: &mut ArrayVec<ValueLabel, 10>,
     units: &mut ArrayVec<Unit, 10>,
     decimal_scale_exponent: &mut isize,
     decimal_offset_exponent: &mut isize,
+    skip_extension_vife: bool,
 ) {
     if let Some(vife) = &value_information_block.value_information_extension {
+        let skip = if skip_extension_vife { 1 } else { 0 };
         let mut is_extension_of_combinable_orthogonal_vife = false;
-        for v in vife {
+        for v in vife.iter().skip(skip) {
             if v.data == 0xFC {
                 is_extension_of_combinable_orthogonal_vife = true;
                 continue;
@@ -909,6 +942,10 @@ fn consume_orthhogonal_vife(
                         units.push(unit!(Minute));
                     }
                     0x66 => {
+                        labels.push(ValueLabel::DurationOfLast);
+                        units.push(unit!(Hour));
+                    }
+                    0x67 => {
                         labels.push(ValueLabel::DurationOfLast);
                         units.push(unit!(Day));
                     }
@@ -1128,6 +1165,7 @@ pub enum ValueLabel {
     SizeOfStorageBlock,
     DescriptionOfTariffAndSubunit,
     StorageInterval,
+    Dimensionless,
     DimensionlessHCA,
     DataContainerForWmbusProtocol,
     PeriodOfNormalDataTransmission,
@@ -1564,7 +1602,7 @@ mod tests {
             ValueInformation::try_from(&result).unwrap(),
             ValueInformation {
                 decimal_offset_exponent: 0,
-                decimal_scale_exponent: 0,
+                decimal_scale_exponent: -2,
                 units: { ArrayVec::<Unit, 10>::new() },
                 labels: {
                     let mut x = ArrayVec::<ValueLabel, 10>::new();
@@ -1683,5 +1721,61 @@ mod tests {
             .contains(&ValueLabel::CumulativeMaximumOfActivePower));
         assert_eq!(vi.units[0].name, UnitName::Watt);
         assert_eq!(vi.decimal_scale_exponent, -3);
+    }
+
+    #[test]
+    fn test_fb_humidity_with_combinatorial_scale() {
+        use crate::value_information::{
+            UnitName, ValueInformation, ValueInformationBlock, ValueLabel,
+        };
+
+        // VIF=0xFB, VIFE=0x9B (0x1B + extension bit), VIFE2=0x74 (multiplicative 10^(4-6) = 10^-2)
+        // OMS RH01: relative humidity 10^0 %, shifted to 10^-2 by combinatorial.
+        let vi = ValueInformation::try_from(
+            &ValueInformationBlock::try_from([0xFB, 0x9B, 0x74].as_slice()).unwrap(),
+        )
+        .unwrap();
+
+        assert!(vi.labels.contains(&ValueLabel::RelativeHumidity));
+        assert_eq!(vi.units[0].name, UnitName::Percent);
+        assert_eq!(vi.decimal_scale_exponent, -2);
+    }
+
+    #[test]
+    fn test_fd_ampere_with_phase_combinatorial() {
+        use crate::value_information::{
+            UnitName, ValueInformation, ValueInformationBlock, ValueLabel,
+        };
+
+        // VIF=0xFD, VIFE=0xD9 (0x59 + extension bit = Ampere 10^-3),
+        // VIFE2=0xFC (combinatorial extension), VIFE3=0x01 (AtPhaseL1)
+        // OMS CA01: per-phase current.
+        let vi = ValueInformation::try_from(
+            &ValueInformationBlock::try_from([0xFD, 0xD9, 0xFC, 0x01].as_slice()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(vi.units[0].name, UnitName::Ampere);
+        assert_eq!(vi.decimal_scale_exponent, -3);
+        assert!(vi.labels.contains(&ValueLabel::AtPhaseL1));
+    }
+
+    #[test]
+    fn test_primary_vif_combinatorial_not_skipped() {
+        use crate::value_information::{
+            UnitName, ValueInformation, ValueInformationBlock, ValueLabel,
+        };
+
+        // VIF=0xE5 (0x65 + extension bit = External temperature 10^-2),
+        // VIFE=0x74 (multiplicative 10^(4-6) = 10^-2)
+        // First VIFE must NOT be skipped for primary VIFs — total should be 10^-4.
+        let vi = ValueInformation::try_from(
+            &ValueInformationBlock::try_from([0xE5, 0x74].as_slice()).unwrap(),
+        )
+        .unwrap();
+
+        assert!(vi.labels.contains(&ValueLabel::ExternalTemperature));
+        assert_eq!(vi.units[0].name, UnitName::Celsius);
+        assert_eq!(vi.decimal_scale_exponent, -4);
     }
 }
